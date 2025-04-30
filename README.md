@@ -16,7 +16,7 @@ A real-time log viewer web application built with Go, featuring WebSocket suppor
 The application can be configured using environment variables:
 
 - `LOG_VIEWER_USERNAME`: Username for basic authentication (default: "admin")
-- `LOG_VIEWER_PASSWORD`: Password for basic authentication (default: "password123")
+- `LOG_VIEWER_PASSWORD`: Password for basic authentication (default: "admin")
 
 ## Usage
 
@@ -35,7 +35,7 @@ docker build -t logviewer .
 docker run -p 8080:8080 \
     -e LOG_VIEWER_USERNAME=your_username \
     -e LOG_VIEWER_PASSWORD=your_password \
-    -v /path/to/logs:/root/ragnarok/log:ro \
+    -v /path/to/logs:/tmp/log:ro \
     logviewer
 ```
 
