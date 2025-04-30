@@ -22,6 +22,8 @@ var (
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
+		ReadBufferSize:  1024 * 1024, // 1MB
+		WriteBufferSize: 1024 * 1024, // 1MB
 	}
 
 	activeTails     = make(map[string]*tail.Tail)
@@ -31,6 +33,158 @@ var (
 	username = getEnvOrDefault("LOG_VIEWER_USERNAME", "admin")
 	password = getEnvOrDefault("LOG_VIEWER_PASSWORD", "admin")
 )
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		fmt.Println("Failed to upgrade connection:", err)
+		return
+	}
+	defer conn.Close()
+
+	// Set WebSocket connection properties
+	conn.SetReadLimit(1024 * 1024) // 1MB max message size
+	conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// Start ping-pong routine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}()
+
+	filePath := r.URL.Query().Get("file")
+	if filePath == "" {
+		return
+	}
+
+	activeTailsLock.Lock()
+	var currentTail *tail.Tail
+	tailFile, exists := activeTails[filePath]
+	if exists {
+		// If file is already being tailed, stop and remove it
+		tailFile.Stop()
+		delete(activeTails, filePath)
+	}
+
+	// First, read the entire file content
+	content, err := os.ReadFile(filePath)
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		buffer := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if line != "" {
+				buffer = append(buffer, line)
+				if len(buffer) >= 1000 { // Send in batches of 1000 lines
+					message := strings.Join(buffer, "\n")
+					if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
+						activeTailsLock.Unlock()
+						return
+					}
+					buffer = buffer[:0]
+				}
+			}
+		}
+		// Send remaining lines
+		if len(buffer) > 0 {
+			message := strings.Join(buffer, "\n")
+			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
+				activeTailsLock.Unlock()
+				return
+			}
+		}
+	}
+
+	config := tail.Config{
+		Follow:    true,
+		ReOpen:    true,
+		Location:  &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
+		MustExist: true,
+		Poll:      true, // Use polling instead of inotify
+	}
+
+	tailFile, tailErr := tail.TailFile(filePath, config)
+	if tailErr != nil {
+		activeTailsLock.Unlock()
+		fmt.Println("Failed to tail file:", tailErr)
+		return
+	}
+
+	currentTail = tailFile
+	activeTails[filePath] = tailFile
+	activeTailsLock.Unlock()
+
+	// Create a buffer for log lines with mutex protection
+	var bufferMutex sync.Mutex
+	buffer := make([]string, 0, 1000) // Increased buffer size
+
+	// Channel to signal goroutine termination
+	done := make(chan struct{})
+	defer close(done)
+
+	// Create ticker for buffer flushing
+	bufferTimer := time.NewTicker(50 * time.Millisecond) // Decreased interval for faster updates
+	defer bufferTimer.Stop()
+
+	// Goroutine for sending buffered messages
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Println("Recovered from panic in buffer goroutine:", r)
+			}
+		}()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-bufferTimer.C:
+				bufferMutex.Lock()
+				if len(buffer) > 0 {
+					message := strings.Join(buffer, "\n")
+					buffer = buffer[:0] // Clear buffer before sending to avoid data race
+					bufferMutex.Unlock()
+
+					if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+						return
+					}
+				} else {
+					bufferMutex.Unlock()
+				}
+			}
+		}
+	}()
+
+	// Read from tail file
+	for line := range currentTail.Lines {
+		select {
+		case <-done:
+			return
+		default:
+			bufferMutex.Lock()
+			buffer = append(buffer, line.Text)
+			bufferMutex.Unlock()
+		}
+	}
+
+	activeTailsLock.Lock()
+	if tf, ok := activeTails[filePath]; ok {
+		tf.Stop()
+		delete(activeTails, filePath)
+	}
+	activeTailsLock.Unlock()
+}
 
 // getEnvOrDefault returns environment variable value or default if not set
 func getEnvOrDefault(key, defaultValue string) string {
@@ -158,6 +312,9 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 		<script>
 			let ws;
 			let selectedLog = null;
+			let reconnectAttempts = 0;
+			const maxReconnectAttempts = 5;
+			const reconnectDelay = 1000; // Start with 1 second delay
 
 			async function loadLogs() {
 				const response = await fetch('/logs');
@@ -174,6 +331,53 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 				});
 			}
 
+			function connectWebSocket(path) {
+				if (ws) {
+					ws.close();
+				}
+
+				ws = new WebSocket('ws://' + window.location.host + '/ws?file=' + encodeURIComponent(path));
+				
+				ws.onopen = function() {
+					console.log('Connected to WebSocket');
+					reconnectAttempts = 0;
+				};
+
+				ws.onmessage = function(event) {
+					const logContent = document.getElementById('logContent');
+					const lines = event.data.split('\n');
+					const fragment = document.createDocumentFragment();
+
+					lines.forEach(line => {
+						if (line) {
+							const lineElement = document.createElement('div');
+							if (selectedLog.endsWith('.leaks')) {
+								lineElement.className = 'leak-line';
+							}
+							lineElement.textContent = line + '\n';
+							fragment.appendChild(lineElement);
+						}
+					});
+
+					logContent.appendChild(fragment);
+					logContent.scrollTop = logContent.scrollHeight;
+				};
+
+				ws.onclose = function() {
+					console.log('WebSocket connection closed');
+					if (reconnectAttempts < maxReconnectAttempts) {
+						reconnectAttempts++;
+						const delay = reconnectDelay * Math.pow(2, reconnectAttempts - 1);
+						console.log('Reconnecting in ' + delay + 'ms...');
+						setTimeout(() => connectWebSocket(path), delay);
+					}
+				};
+
+				ws.onerror = function(error) {
+					console.error('WebSocket error:', error);
+				};
+			}
+
 			function selectLog(path) {
 				if (selectedLog === path) return;
 
@@ -185,28 +389,16 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 					}
 				});
 
-				if (ws) {
-					ws.close();
-				}
-
 				const logContent = document.getElementById('logContent');
 				logContent.innerHTML = '';
 
-				ws = new WebSocket('ws://' + window.location.host + '/ws?file=' + encodeURIComponent(path));
-				ws.onmessage = function(event) {
-					const logContent = document.getElementById('logContent');
-					const line = event.data;
-					const isLeakFile = selectedLog.endsWith('.leaks');
-					const lineElement = document.createElement('div');
-					if (isLeakFile) {
-						lineElement.className = 'leak-line';
-					}
-					lineElement.textContent = line + '\n';
-					logContent.appendChild(lineElement);
-					logContent.scrollTop = logContent.scrollHeight;
-				};
+				connectWebSocket(path);
 			}
 
+			// Reload logs periodically to catch new files
+			setInterval(loadLogs, 30000);
+
+			// Initial load
 			loadLogs();
 		</script>
 	</body>
@@ -240,119 +432,4 @@ func handleGetLogs(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(logFiles)
-}
-
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Println("Failed to upgrade connection:", err)
-		return
-	}
-	defer conn.Close()
-
-	filePath := r.URL.Query().Get("file")
-	if filePath == "" {
-		return
-	}
-
-	activeTailsLock.Lock()
-	var currentTail *tail.Tail
-	tailFile, exists := activeTails[filePath]
-	if exists {
-		// If file is already being tailed, stop and remove it
-		tailFile.Stop()
-		delete(activeTails, filePath)
-	}
-
-	// First, read the entire file content
-	content, err := os.ReadFile(filePath)
-	if err == nil {
-		lines := strings.Split(string(content), "\n")
-		for _, line := range lines {
-			if line != "" {
-				if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(line)); writeErr != nil {
-					activeTailsLock.Unlock()
-					return
-				}
-			}
-		}
-	}
-
-	config := tail.Config{
-		Follow:    true,
-		ReOpen:    true,
-		Location:  &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
-		MustExist: true,
-	}
-
-	tailFile, tailErr := tail.TailFile(filePath, config)
-	if tailErr != nil {
-		activeTailsLock.Unlock()
-		fmt.Println("Failed to tail file:", tailErr)
-		return
-	}
-
-	currentTail = tailFile
-	activeTails[filePath] = tailFile
-	activeTailsLock.Unlock()
-
-	// Create a buffer for log lines with mutex protection
-	var bufferMutex sync.Mutex
-	buffer := make([]string, 0, 100)
-
-	// Channel to signal goroutine termination
-	done := make(chan struct{})
-	defer close(done)
-
-	// Create ticker for buffer flushing
-	bufferTimer := time.NewTicker(100 * time.Millisecond)
-	defer bufferTimer.Stop()
-
-	// Goroutine for sending buffered messages
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Println("Recovered from panic in buffer goroutine:", r)
-			}
-		}()
-
-		for {
-			select {
-			case <-done:
-				return
-			case <-bufferTimer.C:
-				bufferMutex.Lock()
-				if len(buffer) > 0 {
-					message := strings.Join(buffer, "\n")
-					buffer = buffer[:0] // Clear buffer before sending to avoid data race
-					bufferMutex.Unlock()
-
-					if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
-						return
-					}
-				} else {
-					bufferMutex.Unlock()
-				}
-			}
-		}
-	}()
-
-	// Read from tail file
-	for line := range currentTail.Lines {
-		select {
-		case <-done:
-			return
-		default:
-			bufferMutex.Lock()
-			buffer = append(buffer, line.Text)
-			bufferMutex.Unlock()
-		}
-	}
-
-	activeTailsLock.Lock()
-	if tf, ok := activeTails[filePath]; ok {
-		tf.Stop()
-		delete(activeTails, filePath)
-	}
-	activeTailsLock.Unlock()
 }
