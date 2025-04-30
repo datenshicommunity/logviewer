@@ -69,69 +69,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activeTailsLock.Lock()
-	var currentTail *tail.Tail
-	tailFile, exists := activeTails[filePath]
-	if exists {
-		// If file is already being tailed, stop and remove it
-		tailFile.Stop()
-		delete(activeTails, filePath)
-	}
-
-	// First, read the entire file content
-	content, err := os.ReadFile(filePath)
-	if err == nil {
-		lines := strings.Split(string(content), "\n")
-		buffer := make([]string, 0, len(lines))
-		for _, line := range lines {
-			if line != "" {
-				buffer = append(buffer, line)
-				if len(buffer) >= 1000 { // Send in batches of 1000 lines
-					message := strings.Join(buffer, "\n")
-					if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
-						activeTailsLock.Unlock()
-						return
-					}
-					buffer = buffer[:0]
-				}
-			}
-		}
-		// Send remaining lines
-		if len(buffer) > 0 {
-			message := strings.Join(buffer, "\n")
-			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
-				activeTailsLock.Unlock()
-				return
-			}
-		}
-	}
-
-	config := tail.Config{
-		Follow:    true,
-		ReOpen:    true,
-		Location:  &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
-		MustExist: true,
-		Poll:      true, // Use polling instead of inotify
-	}
-
-	tailFile, tailErr := tail.TailFile(filePath, config)
-	if tailErr != nil {
-		activeTailsLock.Unlock()
-		fmt.Println("Failed to tail file:", tailErr)
-		return
-	}
-
-	currentTail = tailFile
-	activeTails[filePath] = tailFile
-	activeTailsLock.Unlock()
+	// Channel to signal goroutine termination
+	done := make(chan struct{})
+	defer close(done)
 
 	// Create a buffer for log lines with mutex protection
 	var bufferMutex sync.Mutex
 	buffer := make([]string, 0, 1000) // Increased buffer size
-
-	// Channel to signal goroutine termination
-	done := make(chan struct{})
-	defer close(done)
 
 	// Create ticker for buffer flushing
 	bufferTimer := time.NewTicker(50 * time.Millisecond) // Decreased interval for faster updates
@@ -166,8 +110,71 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Stop any existing tail for this file
+	activeTailsLock.Lock()
+	if existingTail, exists := activeTails[filePath]; exists {
+		existingTail.Stop()
+		delete(activeTails, filePath)
+	}
+	activeTailsLock.Unlock()
+
+	// First, read the entire file content
+	content, err := os.ReadFile(filePath)
+	if err == nil {
+		lines := strings.Split(string(content), "\n")
+		buffer := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if line != "" {
+				buffer = append(buffer, line)
+				if len(buffer) >= 1000 { // Send in batches of 1000 lines
+					message := strings.Join(buffer, "\n")
+					if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
+						return
+					}
+					buffer = buffer[:0]
+				}
+			}
+		}
+		// Send remaining lines
+		if len(buffer) > 0 {
+			message := strings.Join(buffer, "\n")
+			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
+				return
+			}
+		}
+	}
+
+	config := tail.Config{
+		Follow:    true,
+		ReOpen:    true,
+		Location:  &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
+		MustExist: true,
+		Poll:      true, // Use polling instead of inotify
+	}
+
+	tailFile, tailErr := tail.TailFile(filePath, config)
+	if tailErr != nil {
+		fmt.Println("Failed to tail file:", tailErr)
+		return
+	}
+
+	// Add new tail to active tails
+	activeTailsLock.Lock()
+	activeTails[filePath] = tailFile
+	activeTailsLock.Unlock()
+
+	// Ensure cleanup when connection ends
+	defer func() {
+		activeTailsLock.Lock()
+		if tf, ok := activeTails[filePath]; ok {
+			tf.Stop()
+			delete(activeTails, filePath)
+		}
+		activeTailsLock.Unlock()
+	}()
+
 	// Read from tail file
-	for line := range currentTail.Lines {
+	for line := range tailFile.Lines {
 		select {
 		case <-done:
 			return
@@ -177,13 +184,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			bufferMutex.Unlock()
 		}
 	}
-
-	activeTailsLock.Lock()
-	if tf, ok := activeTails[filePath]; ok {
-		tf.Stop()
-		delete(activeTails, filePath)
-	}
-	activeTailsLock.Unlock()
 }
 
 // getEnvOrDefault returns environment variable value or default if not set
