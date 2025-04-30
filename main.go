@@ -122,22 +122,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	content, err := os.ReadFile(filePath)
 	if err == nil {
 		lines := strings.Split(string(content), "\n")
-		buffer := make([]string, 0, len(lines))
+		initialBuffer := make([]string, 0, len(lines))
 		for _, line := range lines {
 			if line != "" {
-				buffer = append(buffer, line)
-				if len(buffer) >= 1000 { // Send in batches of 1000 lines
-					message := strings.Join(buffer, "\n")
+				initialBuffer = append(initialBuffer, line)
+				if len(initialBuffer) >= 1000 { // Send in batches of 1000 lines
+					message := strings.Join(initialBuffer, "\n")
 					if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
 						return
 					}
-					buffer = buffer[:0]
+					initialBuffer = initialBuffer[:0]
 				}
 			}
 		}
 		// Send remaining lines
-		if len(buffer) > 0 {
-			message := strings.Join(buffer, "\n")
+		if len(initialBuffer) > 0 {
+			message := strings.Join(initialBuffer, "\n")
 			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
 				return
 			}
@@ -172,6 +172,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		activeTailsLock.Unlock()
 	}()
+
+	// Clear the buffer before starting to tail
+	bufferMutex.Lock()
+	buffer = buffer[:0]
+	bufferMutex.Unlock()
 
 	// Read from tail file
 	for line := range tailFile.Lines {
