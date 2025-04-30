@@ -122,22 +122,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	content, err := os.ReadFile(filePath)
 	if err == nil {
 		lines := strings.Split(string(content), "\n")
-		initialBuffer := make([]string, 0, len(lines))
+		// Send initial content in a single batch
+		var initialContent []string
 		for _, line := range lines {
 			if line != "" {
-				initialBuffer = append(initialBuffer, line)
-				if len(initialBuffer) >= 1000 { // Send in batches of 1000 lines
-					message := strings.Join(initialBuffer, "\n")
-					if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
-						return
-					}
-					initialBuffer = initialBuffer[:0]
-				}
+				initialContent = append(initialContent, line)
 			}
 		}
-		// Send remaining lines
-		if len(initialBuffer) > 0 {
-			message := strings.Join(initialBuffer, "\n")
+		if len(initialContent) > 0 {
+			message := strings.Join(initialContent, "\n")
 			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
 				return
 			}
