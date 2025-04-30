@@ -73,43 +73,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	done := make(chan struct{})
 	defer close(done)
 
-	// Create a buffer for log lines with mutex protection
-	var bufferMutex sync.Mutex
-	buffer := make([]string, 0, 1000) // Increased buffer size
-
-	// Create ticker for buffer flushing
-	bufferTimer := time.NewTicker(50 * time.Millisecond) // Decreased interval for faster updates
-	defer bufferTimer.Stop()
-
-	// Goroutine for sending buffered messages
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Println("Recovered from panic in buffer goroutine:", r)
-			}
-		}()
-
-		for {
-			select {
-			case <-done:
-				return
-			case <-bufferTimer.C:
-				bufferMutex.Lock()
-				if len(buffer) > 0 {
-					message := strings.Join(buffer, "\n")
-					buffer = buffer[:0] // Clear buffer before sending to avoid data race
-					bufferMutex.Unlock()
-
-					if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
-						return
-					}
-				} else {
-					bufferMutex.Unlock()
-				}
-			}
-		}
-	}()
-
 	// Stop any existing tail for this file
 	activeTailsLock.Lock()
 	if existingTail, exists := activeTails[filePath]; exists {
@@ -122,25 +85,30 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	content, err := os.ReadFile(filePath)
 	if err == nil {
 		lines := strings.Split(string(content), "\n")
-		// Send initial content in a single batch
-		var initialContent []string
-		for _, line := range lines {
-			if line != "" {
-				initialContent = append(initialContent, line)
+		// Send initial content in chunks to avoid large messages
+		chunkSize := 100
+		for i := 0; i < len(lines); i += chunkSize {
+			end := i + chunkSize
+			if end > len(lines) {
+				end = len(lines)
 			}
-		}
-		if len(initialContent) > 0 {
-			message := strings.Join(initialContent, "\n")
-			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
-				return
-			}
-		}
-	}
 
-	// Only start tailing if the file has been modified in the last minute
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return
+			var chunk []string
+			for _, line := range lines[i:end] {
+				if line != "" {
+					chunk = append(chunk, line)
+				}
+			}
+
+			if len(chunk) > 0 {
+				message := strings.Join(chunk, "\n")
+				if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
+					return
+				}
+				// Small delay to prevent overwhelming the client
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 	}
 
 	config := tail.Config{
@@ -172,32 +140,36 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		activeTailsLock.Unlock()
 	}()
 
-	// Clear the buffer before starting to tail
-	bufferMutex.Lock()
-	buffer = buffer[:0]
-	bufferMutex.Unlock()
+	// Buffer for collecting new lines
+	var buffer []string
+	bufferTimer := time.NewTicker(50 * time.Millisecond)
+	defer bufferTimer.Stop()
 
-	// Create a timer to check for file modifications
-	modificationTimer := time.NewTicker(5 * time.Second)
-	defer modificationTimer.Stop()
-
-	// Read from tail file with modification check
+	// Read from tail file
 	for {
 		select {
 		case <-done:
 			return
 		case line := <-tailFile.Lines:
-			bufferMutex.Lock()
-			buffer = append(buffer, line.Text)
-			bufferMutex.Unlock()
-		case <-modificationTimer.C:
-			// Check if file has been modified
-			currentInfo, err := os.Stat(filePath)
-			if err != nil || currentInfo.ModTime() == fileInfo.ModTime() {
-				// File hasn't been modified, stop tailing
-				return
+			if line.Text != "" {
+				buffer = append(buffer, line.Text)
+				// Send immediately if buffer is getting large
+				if len(buffer) >= 100 {
+					message := strings.Join(buffer, "\n")
+					if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+						return
+					}
+					buffer = buffer[:0]
+				}
 			}
-			fileInfo = currentInfo
+		case <-bufferTimer.C:
+			if len(buffer) > 0 {
+				message := strings.Join(buffer, "\n")
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+					return
+				}
+				buffer = buffer[:0]
+			}
 		}
 	}
 }
