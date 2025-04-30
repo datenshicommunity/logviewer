@@ -51,15 +51,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Start ping-pong routine
+	pingTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Println("Recovered from panic in ping routine:", r)
+			}
+		}()
 
 		for {
-			<-ticker.C
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
+			select {
+			case <-pingTicker.C:
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -83,31 +90,35 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// First, read the entire file content
 	content, err := os.ReadFile(filePath)
-	if err == nil {
-		lines := strings.Split(string(content), "\n")
-		// Send initial content in chunks to avoid large messages
-		chunkSize := 100
-		for i := 0; i < len(lines); i += chunkSize {
-			end := i + chunkSize
-			if end > len(lines) {
-				end = len(lines)
-			}
+	if err != nil {
+		fmt.Printf("Error reading file %s: %v\n", filePath, err)
+		return
+	}
 
-			var chunk []string
-			for _, line := range lines[i:end] {
-				if line != "" {
-					chunk = append(chunk, line)
-				}
-			}
+	lines := strings.Split(string(content), "\n")
+	// Send initial content in chunks to avoid large messages
+	chunkSize := 100
+	for i := 0; i < len(lines); i += chunkSize {
+		end := i + chunkSize
+		if end > len(lines) {
+			end = len(lines)
+		}
 
-			if len(chunk) > 0 {
-				message := strings.Join(chunk, "\n")
-				if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
-					return
-				}
-				// Small delay to prevent overwhelming the client
-				time.Sleep(10 * time.Millisecond)
+		var chunk []string
+		for _, line := range lines[i:end] {
+			if line != "" {
+				chunk = append(chunk, line)
 			}
+		}
+
+		if len(chunk) > 0 {
+			message := strings.Join(chunk, "\n")
+			if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(message)); writeErr != nil {
+				fmt.Printf("Error sending chunk: %v\n", writeErr)
+				return
+			}
+			// Small delay to prevent overwhelming the client
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
@@ -121,7 +132,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	tailFile, tailErr := tail.TailFile(filePath, config)
 	if tailErr != nil {
-		fmt.Println("Failed to tail file:", tailErr)
+		fmt.Printf("Failed to tail file %s: %v\n", filePath, tailErr)
 		return
 	}
 
@@ -145,18 +156,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	bufferTimer := time.NewTicker(50 * time.Millisecond)
 	defer bufferTimer.Stop()
 
-	// Read from tail file
+	// Read from tail file with panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Recovered from panic in tail routine: %v\n", r)
+		}
+	}()
+
 	for {
 		select {
 		case <-done:
 			return
 		case line := <-tailFile.Lines:
-			if line.Text != "" {
+			if line != nil && line.Text != "" {
 				buffer = append(buffer, line.Text)
 				// Send immediately if buffer is getting large
 				if len(buffer) >= 100 {
 					message := strings.Join(buffer, "\n")
 					if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+						fmt.Printf("Error sending buffer: %v\n", err)
 						return
 					}
 					buffer = buffer[:0]
@@ -166,6 +184,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if len(buffer) > 0 {
 				message := strings.Join(buffer, "\n")
 				if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+					fmt.Printf("Error sending buffer: %v\n", err)
 					return
 				}
 				buffer = buffer[:0]
@@ -332,28 +351,32 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 				};
 
 				ws.onmessage = function(event) {
-					const logContent = document.getElementById('logContent');
-					const lines = event.data.split('\n');
-					const fragment = document.createDocumentFragment();
+					try {
+						const logContent = document.getElementById('logContent');
+						const lines = event.data.split('\n');
+						const fragment = document.createDocumentFragment();
 
-					lines.forEach(line => {
-						if (line) {
-							const lineElement = document.createElement('div');
-							if (selectedLog.endsWith('.leaks')) {
-								lineElement.className = 'leak-line';
+						lines.forEach(line => {
+							if (line) {
+								const lineElement = document.createElement('div');
+								if (path.endsWith('.leaks')) {
+									lineElement.className = 'leak-line';
+								}
+								lineElement.textContent = line + '\n';
+								fragment.appendChild(lineElement);
 							}
-							lineElement.textContent = line + '\n';
-							fragment.appendChild(lineElement);
-						}
-					});
+						});
 
-					logContent.appendChild(fragment);
-					logContent.scrollTop = logContent.scrollHeight;
+						logContent.appendChild(fragment);
+						logContent.scrollTop = logContent.scrollHeight;
+					} catch (error) {
+						console.error('Error processing message:', error);
+					}
 				};
 
-				ws.onclose = function() {
-					console.log('WebSocket connection closed');
-					if (reconnectAttempts < maxReconnectAttempts) {
+				ws.onclose = function(event) {
+					console.log('WebSocket connection closed:', event.code, event.reason);
+					if (!event.wasClean && reconnectAttempts < maxReconnectAttempts) {
 						reconnectAttempts++;
 						const delay = reconnectDelay * Math.pow(2, reconnectAttempts - 1);
 						console.log('Reconnecting in ' + delay + 'ms...');
@@ -363,11 +386,12 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 
 				ws.onerror = function(error) {
 					console.error('WebSocket error:', error);
+					ws.close();
 				};
 			}
 
 			function selectLog(path) {
-				if (selectedLog === path) return;
+				if (!path || selectedLog === path) return;
 
 				selectedLog = path;
 				document.querySelectorAll('.log-item').forEach(item => {
