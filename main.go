@@ -137,6 +137,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Only start tailing if the file has been modified in the last minute
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return
+	}
+
 	config := tail.Config{
 		Follow:    true,
 		ReOpen:    true,
@@ -171,15 +177,27 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	buffer = buffer[:0]
 	bufferMutex.Unlock()
 
-	// Read from tail file
-	for line := range tailFile.Lines {
+	// Create a timer to check for file modifications
+	modificationTimer := time.NewTicker(5 * time.Second)
+	defer modificationTimer.Stop()
+
+	// Read from tail file with modification check
+	for {
 		select {
 		case <-done:
 			return
-		default:
+		case line := <-tailFile.Lines:
 			bufferMutex.Lock()
 			buffer = append(buffer, line.Text)
 			bufferMutex.Unlock()
+		case <-modificationTimer.C:
+			// Check if file has been modified
+			currentInfo, err := os.Stat(filePath)
+			if err != nil || currentInfo.ModTime() == fileInfo.ModTime() {
+				// File hasn't been modified, stop tailing
+				return
+			}
+			fileInfo = currentInfo
 		}
 	}
 }
